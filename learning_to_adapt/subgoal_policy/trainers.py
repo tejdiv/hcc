@@ -908,12 +908,12 @@ class Phase2Trainer:
             s_t = states[t:t+1]
             a_t = actions[t:t+1]
 
-            # Update context at t>=2
+            # Update context at t>=2 (detach c to avoid BPTT through all timesteps)
             if t >= 2:
                 with torch.no_grad():
                     p_hat_prev = self.world_model(states[t-2:t-1], actions[t-2:t-1])
                 s_prev = states[t-1:t]
-                c = self.phi(c, p_hat_prev, s_prev)
+                c = self.phi(c.detach(), p_hat_prev, s_prev)  # Break gradient chain
 
             log_prob = self.psi.log_prob(s_t, c, a_t)
             log_probs.append(log_prob)

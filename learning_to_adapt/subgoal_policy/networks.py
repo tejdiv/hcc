@@ -204,14 +204,14 @@ class Policy(nn.Module):
 
         First layer weight shape: (hidden_size, obs_dim + context_dim)
         - W_s: [:, :obs_dim] - keep these (trained in Phase 1)
-        - W_c: [:, obs_dim:] - reinit these (random, small scale, no bias)
+        - W_c: [:, obs_dim:] - reinit these to match W_s scale
         """
         first_layer = self.net[0]  # First Linear layer
         with torch.no_grad():
-            # Reinitialize context portion with small random values (no bias)
-            nn.init.xavier_uniform_(first_layer.weight[:, self.obs_dim:])
-            # Scale down to start near-zero influence
-            first_layer.weight[:, self.obs_dim:] *= 0.01
+            # Get the scale of trained state weights
+            state_weight_std = first_layer.weight[:, :self.obs_dim].std().item()
+            # Reinitialize context portion to match W_s scale
+            nn.init.normal_(first_layer.weight[:, self.obs_dim:], mean=0.0, std=state_weight_std)
 
     def forward(self, s, c=None):
         """
