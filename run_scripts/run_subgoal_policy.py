@@ -275,7 +275,7 @@ def main():
         print("=" * 60)
         print(f"  Initial env: crippled_leg={args.initial_env}")
         print(f"  Policy: π_ψ(a|s) - simple, no context")
-        print(f"  World model: p̂(s_{t+1}|s_t, a_t)")
+        print("  World model: p̂(s_{t+1}|s_t, a_t)")
 
         initial_env = make_env(args.initial_env, args.task, args.normalize_env)
 
