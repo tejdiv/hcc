@@ -7,6 +7,10 @@ Phase 2: GrBAL-style MAML training:
     - Sample segments: τ(t-M, t-1) for adaptation, τ(t, t+K) for evaluation
     - Inner loop: adapt φ, ψ on adaptation segment
     - Outer loop: compute loss on evaluation segment with adapted params
+
+Supports:
+    - n_parallel: CPU parallelization for env sampling
+    - GPU batching for forward passes
 """
 
 import os
@@ -19,6 +23,8 @@ from typing import List, Dict, Optional
 from torch.optim import Adam
 from collections import OrderedDict
 import copy
+from multiprocessing import Process, Pipe
+import pickle
 
 from .networks import (
     WorldModel,
@@ -28,6 +34,138 @@ from .networks import (
     get_params_dict,
     set_params_dict,
 )
+
+
+# ============== Parallel Environment Executor ==============
+
+class ParallelEnvExecutor:
+    """
+    Executes multiple environments in parallel using multiprocessing.
+    Adapted from GrBAL's vectorized_env_executor.py.
+    """
+
+    def __init__(self, env, n_parallel, num_rollouts, max_path_length):
+        assert num_rollouts % n_parallel == 0
+        self.envs_per_proc = int(num_rollouts / n_parallel)
+        self._num_envs = n_parallel * self.envs_per_proc
+        self.n_parallel = n_parallel
+        self.max_path_length = max_path_length
+
+        self.remotes, self.work_remotes = zip(*[Pipe() for _ in range(n_parallel)])
+        seeds = np.random.choice(range(10**6), size=n_parallel, replace=False)
+
+        self.ps = [
+            Process(target=_env_worker,
+                    args=(work_remote, remote, pickle.dumps(env),
+                          self.envs_per_proc, max_path_length, seed))
+            for (work_remote, remote, seed) in zip(self.work_remotes, self.remotes, seeds)
+        ]
+
+        for p in self.ps:
+            p.daemon = True
+            p.start()
+        for remote in self.work_remotes:
+            remote.close()
+
+    def step(self, actions):
+        """Execute actions on all envs in parallel."""
+        assert len(actions) == self.num_envs
+        chunks = lambda l, n: [l[x: x + n] for x in range(0, len(l), n)]
+        actions_per_proc = chunks(actions, self.envs_per_proc)
+
+        for remote, action_list in zip(self.remotes, actions_per_proc):
+            remote.send(('step', action_list))
+
+        results = [remote.recv() for remote in self.remotes]
+        obs, rewards, dones, env_infos = map(lambda x: sum(x, []), zip(*results))
+        return obs, rewards, dones, env_infos
+
+    def reset(self):
+        """Reset all environments."""
+        for remote in self.remotes:
+            remote.send(('reset', None))
+        return sum([remote.recv() for remote in self.remotes], [])
+
+    def close(self):
+        """Close all workers."""
+        for remote in self.remotes:
+            remote.send(('close', None))
+        for p in self.ps:
+            p.join()
+
+    @property
+    def num_envs(self):
+        return self._num_envs
+
+
+class IterativeEnvExecutor:
+    """
+    Executes multiple environments iteratively (no parallelization).
+    """
+
+    def __init__(self, env, num_rollouts, max_path_length):
+        self._num_envs = num_rollouts
+        self.envs = [copy.deepcopy(env) for _ in range(num_rollouts)]
+        self.ts = np.zeros(num_rollouts, dtype='int')
+        self.max_path_length = max_path_length
+
+    def step(self, actions):
+        assert len(actions) == self.num_envs
+        all_results = [env.step(a) for (a, env) in zip(actions, self.envs)]
+        obs, rewards, dones, env_infos = list(map(list, zip(*all_results)))
+
+        dones = np.asarray(dones)
+        self.ts += 1
+        dones = np.logical_or(self.ts >= self.max_path_length, dones)
+
+        for i in np.argwhere(dones).flatten():
+            obs[i] = self.envs[i].reset()
+            self.ts[i] = 0
+
+        return obs, rewards, dones.tolist(), env_infos
+
+    def reset(self):
+        obses = [env.reset() for env in self.envs]
+        self.ts[:] = 0
+        return obses
+
+    def close(self):
+        pass
+
+    @property
+    def num_envs(self):
+        return self._num_envs
+
+
+def _env_worker(remote, parent_remote, env_pickle, n_envs, max_path_length, seed):
+    """Worker process for parallel env execution."""
+    parent_remote.close()
+    envs = [pickle.loads(env_pickle) for _ in range(n_envs)]
+    np.random.seed(seed)
+    ts = np.zeros(n_envs, dtype='int')
+
+    while True:
+        cmd, data = remote.recv()
+
+        if cmd == 'step':
+            all_results = [env.step(a) for (a, env) in zip(data, envs)]
+            obs, rewards, dones, infos = map(list, zip(*all_results))
+            ts += 1
+            for i in range(n_envs):
+                if dones[i] or (ts[i] >= max_path_length):
+                    dones[i] = True
+                    obs[i] = envs[i].reset()
+                    ts[i] = 0
+            remote.send((obs, rewards, dones, infos))
+
+        elif cmd == 'reset':
+            obs = [env.reset() for env in envs]
+            ts[:] = 0
+            remote.send(obs)
+
+        elif cmd == 'close':
+            remote.close()
+            break
 
 
 # ============== Rollout Collection ==============
@@ -65,6 +203,163 @@ def collect_rollout_phase1(env, psi, max_steps, device):
         'next_states': np.array(next_states),
         'dones': np.array(dones),
     }
+
+
+def collect_rollouts_parallel_phase1(vec_env, psi, max_steps, device):
+    """
+    Collect rollouts in parallel using vectorized env executor.
+    Uses GPU batching for policy forward passes.
+    """
+    num_envs = vec_env.num_envs
+    running_paths = [{'states': [], 'actions': [], 'rewards': [], 'next_states': [], 'dones': []}
+                     for _ in range(num_envs)]
+    completed_paths = []
+
+    obses = vec_env.reset()
+    n_samples = 0
+    total_samples = num_envs * max_steps
+
+    while n_samples < total_samples and len(completed_paths) < num_envs:
+        # GPU batch: get actions for all envs at once
+        obses_tensor = torch.as_tensor(np.array(obses), dtype=torch.float32, device=device)
+        with torch.no_grad():
+            actions, _ = psi.sample(obses_tensor, c=None)
+        actions_np = actions.cpu().numpy()
+
+        # Step all envs in parallel
+        next_obses, rewards, dones, _ = vec_env.step(list(actions_np))
+
+        for idx in range(num_envs):
+            if len(running_paths[idx]['states']) < max_steps:
+                running_paths[idx]['states'].append(obses[idx])
+                running_paths[idx]['actions'].append(actions_np[idx])
+                running_paths[idx]['rewards'].append(rewards[idx])
+                running_paths[idx]['next_states'].append(next_obses[idx])
+                running_paths[idx]['dones'].append(dones[idx])
+
+                if dones[idx]:
+                    completed_paths.append({
+                        'states': np.array(running_paths[idx]['states']),
+                        'actions': np.array(running_paths[idx]['actions']),
+                        'rewards': np.array(running_paths[idx]['rewards']),
+                        'next_states': np.array(running_paths[idx]['next_states']),
+                        'dones': np.array(running_paths[idx]['dones']),
+                    })
+                    n_samples += len(running_paths[idx]['states'])
+                    running_paths[idx] = {'states': [], 'actions': [], 'rewards': [],
+                                          'next_states': [], 'dones': []}
+
+        obses = next_obses
+
+    # Add any incomplete paths
+    for idx in range(num_envs):
+        if len(running_paths[idx]['states']) > 0:
+            completed_paths.append({
+                'states': np.array(running_paths[idx]['states']),
+                'actions': np.array(running_paths[idx]['actions']),
+                'rewards': np.array(running_paths[idx]['rewards']),
+                'next_states': np.array(running_paths[idx]['next_states']),
+                'dones': np.array(running_paths[idx]['dones']),
+            })
+
+    return completed_paths
+
+
+def collect_rollouts_parallel_phase2(vec_env, world_model, phi, psi, max_steps, device):
+    """
+    Collect rollouts in parallel with context-conditioned policy.
+    Uses GPU batching for all forward passes.
+    """
+    num_envs = vec_env.num_envs
+    running_paths = [{'states': [], 'actions': [], 'rewards': [], 'next_states': [], 'dones': [],
+                      'states_history': [], 'actions_history': []}
+                     for _ in range(num_envs)]
+    completed_paths = []
+
+    # Initialize contexts for all envs (batch on GPU)
+    contexts = phi.reset_context(batch_size=num_envs, device=device)
+
+    obses = vec_env.reset()
+    for idx in range(num_envs):
+        running_paths[idx]['states_history'].append(
+            obses[idx].copy() if isinstance(obses[idx], np.ndarray) else np.array(obses[idx]))
+
+    t = 0
+    while len(completed_paths) < num_envs and t < max_steps:
+        # GPU batch: update contexts for all envs at t>=2
+        if t >= 2:
+            # Gather states and actions from history
+            s_t_minus_2_list = []
+            a_t_minus_2_list = []
+            s_prev_list = []
+            valid_indices = []
+
+            for idx in range(num_envs):
+                if len(running_paths[idx]['states_history']) >= 3:
+                    s_t_minus_2_list.append(running_paths[idx]['states_history'][-3])
+                    a_t_minus_2_list.append(running_paths[idx]['actions_history'][-2])
+                    s_prev_list.append(running_paths[idx]['states_history'][-2])
+                    valid_indices.append(idx)
+
+            if valid_indices:
+                s_t_minus_2_batch = torch.as_tensor(np.array(s_t_minus_2_list), dtype=torch.float32, device=device)
+                a_t_minus_2_batch = torch.as_tensor(np.array(a_t_minus_2_list), dtype=torch.float32, device=device)
+                s_prev_batch = torch.as_tensor(np.array(s_prev_list), dtype=torch.float32, device=device)
+
+                with torch.no_grad():
+                    p_hat_batch = world_model(s_t_minus_2_batch, a_t_minus_2_batch)
+                    c_subset = contexts[valid_indices]
+                    c_new = phi(c_subset, p_hat_batch, s_prev_batch)
+                    contexts[valid_indices] = c_new
+
+        # GPU batch: get actions for all envs
+        obses_tensor = torch.as_tensor(np.array(obses), dtype=torch.float32, device=device)
+        with torch.no_grad():
+            actions, _ = psi.sample(obses_tensor, contexts)
+        actions_np = actions.cpu().numpy()
+
+        # Step all envs in parallel
+        next_obses, rewards, dones, _ = vec_env.step(list(actions_np))
+
+        for idx in range(num_envs):
+            running_paths[idx]['states'].append(obses[idx])
+            running_paths[idx]['actions'].append(actions_np[idx])
+            running_paths[idx]['rewards'].append(rewards[idx])
+            running_paths[idx]['next_states'].append(next_obses[idx])
+            running_paths[idx]['dones'].append(dones[idx])
+            running_paths[idx]['actions_history'].append(actions_np[idx])
+            running_paths[idx]['states_history'].append(
+                next_obses[idx].copy() if isinstance(next_obses[idx], np.ndarray) else np.array(next_obses[idx]))
+
+            if dones[idx]:
+                completed_paths.append({
+                    'states': np.array(running_paths[idx]['states']),
+                    'actions': np.array(running_paths[idx]['actions']),
+                    'rewards': np.array(running_paths[idx]['rewards']),
+                    'next_states': np.array(running_paths[idx]['next_states']),
+                    'dones': np.array(running_paths[idx]['dones']),
+                })
+                # Reset this env's running path and context
+                running_paths[idx] = {'states': [], 'actions': [], 'rewards': [],
+                                      'next_states': [], 'dones': [],
+                                      'states_history': [next_obses[idx]], 'actions_history': []}
+                contexts[idx] = phi.reset_context(batch_size=1, device=device).squeeze(0)
+
+        obses = next_obses
+        t += 1
+
+    # Add incomplete paths
+    for idx in range(num_envs):
+        if len(running_paths[idx]['states']) > 0:
+            completed_paths.append({
+                'states': np.array(running_paths[idx]['states']),
+                'actions': np.array(running_paths[idx]['actions']),
+                'rewards': np.array(running_paths[idx]['rewards']),
+                'next_states': np.array(running_paths[idx]['next_states']),
+                'dones': np.array(running_paths[idx]['dones']),
+            })
+
+    return completed_paths
 
 
 def collect_rollout_phase2(env, world_model, phi, psi, max_steps, device):
@@ -148,6 +443,10 @@ class Phase1Trainer:
     Trains:
         - π_ψ(a|s): Simple policy without context
         - p̂(s_{t+1}|s_t,a_t): World model
+
+    Supports:
+        - n_parallel: CPU parallelization for env sampling
+        - GPU batching for policy forward passes
     """
 
     def __init__(
@@ -166,6 +465,17 @@ class Phase1Trainer:
 
         self.world_model.to(self.device)
         self.psi.to(self.device)
+
+        # Parallelization
+        self.n_parallel = config.get('n_parallel', 1)
+        self.num_rollouts = config.get('batch_size', 10)
+        max_path_length = config.get('max_path_length', 1000)
+
+        # Setup vectorized env executor
+        if self.n_parallel > 1:
+            self.vec_env = ParallelEnvExecutor(env, self.n_parallel, self.num_rollouts, max_path_length)
+        else:
+            self.vec_env = IterativeEnvExecutor(env, self.num_rollouts, max_path_length)
 
         self.policy_optimizer = Adam(
             self.psi.parameters(),
@@ -189,6 +499,9 @@ class Phase1Trainer:
         self.minibatch_size = config.get('minibatch_size', 64)
         self.entropy_coef = config.get('entropy_coef', 0.01)
         self.max_grad_norm = config.get('max_grad_norm', 0.5)
+
+        # Track timesteps
+        self.n_timesteps = 0
 
         self.log_history = []
 
@@ -303,7 +616,7 @@ class Phase1Trainer:
         }
 
     def train(self, n_iterations: int = None, save_dir: str = None):
-        """Run Phase 1 training."""
+        """Run Phase 1 training with parallel env sampling."""
         n_iterations = n_iterations or self.config.get('phase1_iterations', 500)
         batch_size = self.config.get('batch_size', 20)
         max_path_length = self.config.get('max_path_length', 1000)
@@ -314,6 +627,7 @@ class Phase1Trainer:
         print(f"Phase 1: Training for {n_iterations} iterations")
         print(f"  Batch size: {batch_size} trajectories")
         print(f"  Max path length: {max_path_length}")
+        print(f"  n_parallel: {self.n_parallel}")
 
         self.csv_file = None
         self.csv_writer = None
@@ -324,16 +638,18 @@ class Phase1Trainer:
 
         for iteration in range(n_iterations):
             self.psi.eval()
-            trajectories = []
-            for _ in range(batch_size):
-                traj = collect_rollout_phase1(
-                    env=self.env,
-                    psi=self.psi,
-                    max_steps=max_path_length,
-                    device=self.device,
-                )
-                trajectories.append(traj)
+
+            # Collect trajectories in parallel with GPU batching
+            trajectories = collect_rollouts_parallel_phase1(
+                vec_env=self.vec_env,
+                psi=self.psi,
+                max_steps=max_path_length,
+                device=self.device,
+            )
+
+            for traj in trajectories:
                 self.add_to_buffer(traj)
+                self.n_timesteps += len(traj['states'])
 
             episode_rewards = [traj['rewards'].sum() for traj in trajectories]
             episode_lengths = [len(traj['rewards']) for traj in trajectories]
@@ -352,6 +668,7 @@ class Phase1Trainer:
             log_entry = {
                 'iteration': iteration,
                 'phase': 1,
+                'n_timesteps': self.n_timesteps,
                 'mean_episode_reward': np.mean(episode_rewards),
                 'std_episode_reward': np.std(episode_rewards),
                 'mean_episode_length': np.mean(episode_lengths),
@@ -442,6 +759,20 @@ class Phase2Trainer:
         self.phi.to(self.device)
         self.psi.to(self.device)
 
+        # Parallelization
+        self.n_parallel = config.get('n_parallel', 1)
+        self.num_rollouts_per_env = config.get('num_rollouts', 5)
+        max_path_length = config.get('max_path_length', 1000)
+
+        # Setup vectorized env executors for each training environment
+        self.vec_envs = []
+        for env in train_envs:
+            if self.n_parallel > 1:
+                vec_env = ParallelEnvExecutor(env, self.n_parallel, self.num_rollouts_per_env, max_path_length)
+            else:
+                vec_env = IterativeEnvExecutor(env, self.num_rollouts_per_env, max_path_length)
+            self.vec_envs.append(vec_env)
+
         # Freeze world model
         self.world_model.eval()
         for p in self.world_model.parameters():
@@ -471,16 +802,16 @@ class Phase2Trainer:
 
         self.log_history = []
 
-    def collect_and_store_trajectory(self, env_idx):
-        """Collect a trajectory and add to dataset D for environment."""
-        env = self.train_envs[env_idx]
+    def collect_and_store_trajectories(self, env_idx):
+        """Collect trajectories in parallel and add to dataset D for environment."""
         max_path_length = self.config.get('max_path_length', 1000)
 
         self.phi.eval()
         self.psi.eval()
 
-        traj = collect_rollout_phase2(
-            env=env,
+        # Use parallel collection with GPU batching
+        trajectories = collect_rollouts_parallel_phase2(
+            vec_env=self.vec_envs[env_idx],
             world_model=self.world_model,
             phi=self.phi,
             psi=self.psi,
@@ -488,17 +819,17 @@ class Phase2Trainer:
             device=self.device,
         )
 
-        self.datasets[env_idx].append(traj)
-
-        # Track total timesteps for sample efficiency
-        self.n_timesteps += len(traj['states'])
+        for traj in trajectories:
+            self.datasets[env_idx].append(traj)
+            # Track total timesteps for sample efficiency
+            self.n_timesteps += len(traj['states'])
 
         # Limit dataset size
         max_trajs = self.config.get('max_trajs_per_env', 50)
         if len(self.datasets[env_idx]) > max_trajs:
             self.datasets[env_idx] = self.datasets[env_idx][-max_trajs:]
 
-        return traj
+        return trajectories
 
     def sample_segments(self, env_idx):
         """
@@ -676,6 +1007,7 @@ class Phase2Trainer:
 
         print(f"Phase 2: GrBAL-style MAML training for {n_iterations} iterations")
         print(f"  Training envs: {len(self.train_envs)}")
+        print(f"  n_parallel: {self.n_parallel}, rollouts per env: {self.num_rollouts_per_env}")
         print(f"  M (adapt steps): {self.M}, K (eval steps): {self.K}")
         print(f"  Inner LR: {self.inner_lr}, Adapt gradient steps: {self.adapt_steps}")
         print(f"  Meta batch size: {N}")
@@ -692,7 +1024,7 @@ class Phase2Trainer:
             # Collect new trajectories periodically (like GrBAL's n_S)
             if iteration % self.task_sampling_freq == 0:
                 for env_idx in range(len(self.train_envs)):
-                    self.collect_and_store_trajectory(env_idx)
+                    self.collect_and_store_trajectories(env_idx)
 
             meta_loss = 0.0
             valid_tasks = 0

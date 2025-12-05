@@ -88,6 +88,12 @@ def parse_args():
     parser.add_argument('--world_model_hidden_sizes', type=int, nargs='+', default=[256, 256],
                         help='World model hidden layer sizes')
 
+    # === Parallelization ===
+    parser.add_argument('--n_parallel', type=int, default=5,
+                        help='Number of parallel workers for env sampling (CPU parallelization)')
+    parser.add_argument('--num_rollouts', type=int, default=5,
+                        help='Number of rollouts per environment per collection')
+
     # === Phase 1 Training ===
     parser.add_argument('--phase1_iterations', type=int, default=100,
                         help='Phase 1 training iterations')
