@@ -163,12 +163,14 @@ class Policy(nn.Module):
     """
     π_ψ: Gaussian policy.
 
-    Two modes:
-    - Phase 1: π_ψ(a|s) - simple policy, no context
+    Single network path for both phases:
+    - Phase 1: π_ψ(a|s, c=0) - context zeroed out
     - Phase 2/3: π_ψ(a|s, c_t) - context-conditioned
 
+    Before Phase 2, call reinit_context_weights() to randomly initialize
+    the context-attending portion of the first layer (no bias).
+
     Uses tanh squashing for bounded actions.
-    Architecture scaled up for more capacity.
     """
 
     def __init__(self, obs_dim, act_dim, context_dim=32, hidden_sizes=(128, 128),
@@ -177,19 +179,15 @@ class Policy(nn.Module):
         self.obs_dim = obs_dim
         self.act_dim = act_dim
         self.context_dim = context_dim
+        self.hidden_sizes = hidden_sizes
         self.log_std_min = log_std_min
         self.log_std_max = log_std_max
 
-        # Phase 1: simple policy (no context)
-        self.simple_net = self._build_mlp(obs_dim, hidden_sizes)
-        self.simple_mean = nn.Linear(hidden_sizes[-1], act_dim)
-        self.simple_log_std = nn.Linear(hidden_sizes[-1], act_dim)
-
-        # Phase 2/3: context-conditioned policy
+        # Single network: input is [s, c] where c=0 in Phase 1
         input_dim = obs_dim + context_dim
-        self.context_net = self._build_mlp(input_dim, hidden_sizes)
-        self.context_mean = nn.Linear(hidden_sizes[-1], act_dim)
-        self.context_log_std = nn.Linear(hidden_sizes[-1], act_dim)
+        self.net = self._build_mlp(input_dim, hidden_sizes)
+        self.mean_head = nn.Linear(hidden_sizes[-1], act_dim)
+        self.log_std_head = nn.Linear(hidden_sizes[-1], act_dim)
 
     def _build_mlp(self, input_dim, hidden_sizes):
         layers = []
@@ -199,29 +197,42 @@ class Policy(nn.Module):
             input_dim = hidden_dim
         return nn.Sequential(*layers)
 
+    def reinit_context_weights(self):
+        """
+        Reinitialize the context-attending weights of the first layer.
+        Called before Phase 2 to randomly init W_c while keeping W_s.
+
+        First layer weight shape: (hidden_size, obs_dim + context_dim)
+        - W_s: [:, :obs_dim] - keep these (trained in Phase 1)
+        - W_c: [:, obs_dim:] - reinit these (random, small scale, no bias)
+        """
+        first_layer = self.net[0]  # First Linear layer
+        with torch.no_grad():
+            # Reinitialize context portion with small random values (no bias)
+            nn.init.xavier_uniform_(first_layer.weight[:, self.obs_dim:])
+            # Scale down to start near-zero influence
+            first_layer.weight[:, self.obs_dim:] *= 0.01
+
     def forward(self, s, c=None):
         """
         Compute mean and log_std of action distribution.
 
         Args:
             s: current state (batch, obs_dim)
-            c: context (batch, context_dim) - None for Phase 1
+            c: context (batch, context_dim) - if None, uses zeros
 
         Returns:
             mean: action mean (batch, act_dim)
             log_std: action log std (batch, act_dim)
         """
+        # If no context provided, use zeros (Phase 1 behavior)
         if c is None:
-            # Phase 1: simple policy
-            features = self.simple_net(s)
-            mean = self.simple_mean(features)
-            log_std = self.simple_log_std(features)
-        else:
-            # Phase 2/3: context-conditioned
-            x = torch.cat([s, c], dim=-1)
-            features = self.context_net(x)
-            mean = self.context_mean(features)
-            log_std = self.context_log_std(features)
+            c = torch.zeros(s.shape[0], self.context_dim, device=s.device)
+
+        x = torch.cat([s, c], dim=-1)
+        features = self.net(x)
+        mean = self.mean_head(features)
+        log_std = self.log_std_head(features)
 
         log_std = torch.clamp(log_std, self.log_std_min, self.log_std_max)
         return mean, log_std
@@ -325,22 +336,25 @@ def set_params_dict(module, params_dict):
 def functional_forward_policy(params, s, c, obs_dim, act_dim, context_dim, hidden_sizes, log_std_min, log_std_max):
     """
     Functional forward pass for policy (for MAML gradient computation).
-    Uses context-conditioned path only (Phase 2/3).
     """
+    # If no context, use zeros
+    if c is None:
+        c = torch.zeros(s.shape[0], context_dim, device=s.device)
+
     x = torch.cat([s, c], dim=-1)
 
-    # context_net forward
+    # net forward (unified network)
     idx = 0
     for i, hidden_dim in enumerate(hidden_sizes):
-        weight = params[f'context_net.{idx}.weight']
-        bias = params[f'context_net.{idx}.bias']
+        weight = params[f'net.{idx}.weight']
+        bias = params[f'net.{idx}.bias']
         x = F.linear(x, weight, bias)
         x = F.relu(x)
         idx += 2  # Skip ReLU (no params)
 
     # Mean and log_std heads
-    mean = F.linear(x, params['context_mean.weight'], params['context_mean.bias'])
-    log_std = F.linear(x, params['context_log_std.weight'], params['context_log_std.bias'])
+    mean = F.linear(x, params['mean_head.weight'], params['mean_head.bias'])
+    log_std = F.linear(x, params['log_std_head.weight'], params['log_std_head.bias'])
     log_std = torch.clamp(log_std, log_std_min, log_std_max)
 
     return mean, log_std

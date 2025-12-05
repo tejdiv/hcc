@@ -318,6 +318,11 @@ def main():
         print(f"  M (adapt segment): {args.M}, K (eval segment): {args.K}")
         print(f"  Inner LR: {args.inner_lr}, Adapt steps: {args.adapt_steps}")
 
+        # Reinitialize context-attending weights before Phase 2
+        # Keeps state-attending weights from Phase 1, random init for context weights
+        psi.reinit_context_weights()
+        print("  Reinitialized context-attending weights in policy")
+
         train_envs = [make_env(leg, args.task, args.normalize_env)
                       for leg in args.train_envs]
 
