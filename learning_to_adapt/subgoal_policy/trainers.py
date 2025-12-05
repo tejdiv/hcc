@@ -1002,7 +1002,7 @@ class Phase2Trainer:
     def train(self, n_iterations: int = None, save_dir: str = None):
         """Run Phase 2 GrBAL-style training."""
         n_iterations = n_iterations or self.config.get('phase2_iterations', 500)
-        N = self.config.get('meta_batch_size', len(self.train_envs))  # Tasks per meta-batch
+        N = self.config.get('meta_batch_size') or len(self.train_envs)  # Tasks per meta-batch
         save_every = self.config.get('save_every', 50)
 
         print(f"Phase 2: GrBAL-style MAML training for {n_iterations} iterations")

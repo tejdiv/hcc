@@ -80,12 +80,14 @@ def parse_args():
     parser.add_argument('--test_envs', type=int, nargs='+', default=[5],
                         help='Crippled legs for Phase 3 (test envs)')
 
-    # === Architecture (~275K params, half of GrBAL) ===
-    parser.add_argument('--context_dim', type=int, default=32,
+    # === Architecture (each network ~24K params) ===
+    parser.add_argument('--context_dim', type=int, default=48,
                         help='Context vector dimension')
+    parser.add_argument('--context_hidden_dim', type=int, default=90,
+                        help='Context encoder hidden dimension')
     parser.add_argument('--policy_hidden_sizes', type=int, nargs='+', default=[128, 128],
                         help='Policy network hidden layer sizes')
-    parser.add_argument('--world_model_hidden_sizes', type=int, nargs='+', default=[256, 256],
+    parser.add_argument('--world_model_hidden_sizes', type=int, nargs='+', default=[128, 128],
                         help='World model hidden layer sizes')
 
     # === Parallelization ===
@@ -254,7 +256,7 @@ def main():
 
     # Initialize networks
     world_model = WorldModel(obs_dim, act_dim, world_model_hidden_sizes)
-    phi = ContextEncoder(obs_dim, args.context_dim)
+    phi = ContextEncoder(obs_dim, args.context_dim, args.context_hidden_dim)
     psi = Policy(obs_dim, act_dim, args.context_dim, policy_hidden_sizes)
 
     # Print parameter counts
