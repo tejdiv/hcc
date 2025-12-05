@@ -160,11 +160,12 @@ class Phase3Evaluator:
             if loss is None:
                 break
 
-            # Compute gradients
+            # Compute gradients (retain_graph for first call since we call grad twice)
             phi_grads = torch.autograd.grad(
                 loss,
                 list(self.phi.parameters()),
                 create_graph=False,
+                retain_graph=True,  # Keep graph for psi_grads
                 allow_unused=True,
             )
             psi_grads = torch.autograd.grad(

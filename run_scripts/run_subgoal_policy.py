@@ -75,7 +75,7 @@ def parse_args():
     # === Train/Test Split ===
     parser.add_argument('--initial_env', type=int, default=1,
                         help='Crippled leg for Phase 1 (initial env)')
-    parser.add_argument('--train_envs', type=int, nargs='+', default=[2, 3, 4],
+    parser.add_argument('--train_envs', type=int, nargs='+', default=[2, 3, 4, 5],
                         help='Crippled legs for Phase 2 (training envs)')
     parser.add_argument('--test_envs', type=int, nargs='+', default=[5],
                         help='Crippled legs for Phase 3 (test envs)')
