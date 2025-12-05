@@ -1,43 +1,27 @@
 """
-Subgoal-Conditioned Policy with Context Adaptation.
+Subgoal-Conditioned Policy with MAML-style Adaptation.
 
 A meta-learning approach that:
-1. Learns a state proposer f_theta that predicts next state goals
-2. Learns a policy pi_psi conditioned on (state, goal, context)
-3. Learns a context encoder f_phi that tracks world model error
+1. Learns a world model p̂(s_{t+1}|s_t, a_t) in Phase 1
+2. Learns a simple policy π_ψ(a|s) in Phase 1
+3. Learns a context encoder f_φ that tracks world model error: c_t = f(c_{t-1}, p̂_{t-1}, s_{t-1})
+4. MAML-style meta-training of φ and ψ in Phase 2
 
 Training phases:
-- Phase 1: Train theta, psi on initial environment (c=0)
-- Phase 2: Freeze theta, train phi, psi across training environments
-- Phase 3: Freeze all, evaluate with context adaptation on test environments
+- Phase 1: Train π_ψ(a|s) and p̂(s_{t+1}|s_t,a_t) on initial environment
+- Phase 2: Freeze p̂, MAML-train φ and ψ across training environments
+- Phase 3: MAML-style test-time adaptation on test environments
 """
 
 from .networks import (
-    StateProposer,
+    WorldModel,
     ContextEncoder,
     Policy,
     SubgoalPolicyNetwork,
-)
-
-from .grpo_ppo import (
-    compute_returns,
-    compute_advantages_grpo,
-    ppo_loss,
-    state_prediction_loss,
-    GRPOPPOTrainer,
-)
-
-from .rollout import (
-    collect_trajectory_phase1,
-    collect_trajectory_phase2,
-    collect_batch_phase1,
-    collect_batch_phase2,
-    collect_batch_vectorized_phase1,
-    collect_batch_vectorized_phase2,
-    collect_batch_parallel_phase1,
-    collect_batch_parallel_phase2,
-    compute_trajectory_stats,
-    HAS_PARALLEL_EXECUTOR,
+    StateProposer,  # Legacy compatibility
+    get_params_dict,
+    set_params_dict,
+    clone_params,
 )
 
 from .trainers import (
@@ -45,46 +29,35 @@ from .trainers import (
     Phase2Trainer,
     load_phase1_checkpoint,
     load_phase2_checkpoint,
+    collect_rollout_phase1,
+    collect_rollout_phase2,
+    compute_returns,
 )
 
 from .evaluation import (
-    evaluate_single_episode,
-    evaluate_on_env,
     Phase3Evaluator,
     run_evaluation,
 )
 
 __all__ = [
     # Networks
-    'StateProposer',
+    'WorldModel',
     'ContextEncoder',
     'Policy',
     'SubgoalPolicyNetwork',
-    # Training
-    'compute_returns',
-    'compute_advantages_grpo',
-    'ppo_loss',
-    'state_prediction_loss',
-    'GRPOPPOTrainer',
-    # Rollout
-    'collect_trajectory_phase1',
-    'collect_trajectory_phase2',
-    'collect_batch_phase1',
-    'collect_batch_phase2',
-    'collect_batch_vectorized_phase1',
-    'collect_batch_vectorized_phase2',
-    'collect_batch_parallel_phase1',
-    'collect_batch_parallel_phase2',
-    'compute_trajectory_stats',
-    'HAS_PARALLEL_EXECUTOR',
+    'StateProposer',  # Legacy
+    'get_params_dict',
+    'set_params_dict',
+    'clone_params',
     # Trainers
     'Phase1Trainer',
     'Phase2Trainer',
     'load_phase1_checkpoint',
     'load_phase2_checkpoint',
+    'collect_rollout_phase1',
+    'collect_rollout_phase2',
+    'compute_returns',
     # Evaluation
-    'evaluate_single_episode',
-    'evaluate_on_env',
     'Phase3Evaluator',
     'run_evaluation',
 ]

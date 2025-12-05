@@ -1,0 +1,42 @@
+{
+  "exp_name": "lambda_run_001",
+  "save_dir": "./data/subgoal_policy",
+  "seed": 42,
+  "task": "cripple",
+  "max_path_length": 1000,
+  "normalize_env": true,
+  "initial_env": 1,
+  "train_envs": [
+    2,
+    3,
+    4
+  ],
+  "test_envs": [
+    5
+  ],
+  "hidden_dim": 64,
+  "context_dim": 16,
+  "lr": 0.0003,
+  "gamma": 0.99,
+  "clip_eps": 0.2,
+  "ppo_epochs": 10,
+  "minibatch_size": 64,
+  "max_grad_norm": 0.5,
+  "entropy_coef": 0.0,
+  "phase1_iterations": 50,
+  "phase1_batch_size": 10,
+  "lambda_theta": 1.0,
+  "phase2_iterations": 50,
+  "n_traj_per_env": 5,
+  "eval_episodes": 10,
+  "deterministic_eval": true,
+  "save_every": 50,
+  "checkpoint": null,
+  "skip_phase1": false,
+  "skip_phase2": false,
+  "skip_phase3": false,
+  "device": "cuda",
+  "vectorized": false,
+  "parallel": true,
+  "n_parallel": 10
+}

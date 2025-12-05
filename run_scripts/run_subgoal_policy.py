@@ -1,9 +1,17 @@
 #!/usr/bin/env python
 """
-Main entry point for Subgoal-Conditioned Policy training.
+Main entry point for GrBAL-style Subgoal-Conditioned Policy training.
+
+Architecture:
+- Phase 1: Train π_ψ(a|s) simple policy + p̂(s_{t+1}|s_t,a_t) world model on single env
+- Phase 2: GrBAL-style MAML training with segment sampling:
+    - Sample τ(t-M, t-1) for adaptation, τ(t, t+K) for evaluation
+    - Inner loop: adapt φ, ψ on adaptation segment
+    - Outer loop: compute loss on evaluation segment
+- Phase 3: GrBAL-style online test-time adaptation at every timestep
 
 Usage:
-    # Run full pipeline (Phase 1, 2, 3)
+    # Run full pipeline
     python run_scripts/run_subgoal_policy.py
 
     # Custom experiment name
@@ -12,11 +20,8 @@ Usage:
     # Custom train/test split
     python run_scripts/run_subgoal_policy.py --initial_env 1 --train_envs 2 3 4 --test_envs 5
 
-    # Skip phases (e.g., only evaluate)
+    # Skip phases
     python run_scripts/run_subgoal_policy.py --skip_phase1 --skip_phase2 --checkpoint path/to/phase2.pt
-
-    # Adjust iterations
-    python run_scripts/run_subgoal_policy.py --phase1_iterations 1000 --phase2_iterations 1000
 """
 
 import os
@@ -34,7 +39,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from learning_to_adapt.envs.half_cheetah_env import HalfCheetahEnv
 from learning_to_adapt.envs.normalized_env import normalize
 from learning_to_adapt.subgoal_policy import (
-    StateProposer,
+    WorldModel,
     ContextEncoder,
     Policy,
     Phase1Trainer,
@@ -47,7 +52,7 @@ from learning_to_adapt.subgoal_policy import (
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='Subgoal-Conditioned Policy Training',
+        description='MAML-style Subgoal-Conditioned Policy Training',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -75,15 +80,67 @@ def parse_args():
     parser.add_argument('--test_envs', type=int, nargs='+', default=[5],
                         help='Crippled legs for Phase 3 (test envs)')
 
-    # === Architecture ===
-    parser.add_argument('--hidden_dim', type=int, default=64,
-                        help='Hidden layer dimension')
-    parser.add_argument('--context_dim', type=int, default=16,
+    # === Architecture (~275K params, half of GrBAL) ===
+    parser.add_argument('--context_dim', type=int, default=32,
                         help='Context vector dimension')
+    parser.add_argument('--policy_hidden_sizes', type=int, nargs='+', default=[128, 128],
+                        help='Policy network hidden layer sizes')
+    parser.add_argument('--world_model_hidden_sizes', type=int, nargs='+', default=[256, 256],
+                        help='World model hidden layer sizes')
 
-    # === Training ===
-    parser.add_argument('--lr', type=float, default=3e-4,
-                        help='Learning rate')
+    # === Phase 1 Training ===
+    parser.add_argument('--phase1_iterations', type=int, default=100,
+                        help='Phase 1 training iterations')
+    parser.add_argument('--batch_size', type=int, default=10,
+                        help='Trajectories per Phase 1 iteration')
+    parser.add_argument('--policy_lr', type=float, default=3e-4,
+                        help='Policy learning rate')
+    parser.add_argument('--world_model_lr', type=float, default=1e-3,
+                        help='World model learning rate')
+    parser.add_argument('--world_model_train_freq', type=int, default=5,
+                        help='Train world model every N iterations')
+    parser.add_argument('--world_model_epochs', type=int, default=10,
+                        help='World model training epochs per update')
+    parser.add_argument('--world_model_batch_size', type=int, default=256,
+                        help='World model minibatch size')
+
+    # === Phase 2 GrBAL-style MAML Training ===
+    parser.add_argument('--phase2_iterations', type=int, default=100,
+                        help='Phase 2 training iterations')
+    parser.add_argument('--meta_lr', type=float, default=1e-3,
+                        help='Meta-learning rate (outer loop)')
+    parser.add_argument('--inner_lr', type=float, default=0.01,
+                        help='Inner loop learning rate')
+    parser.add_argument('--adapt_steps', type=int, default=1,
+                        help='Number of gradient steps in inner loop')
+    parser.add_argument('--M', type=int, default=20,
+                        help='Adaptation segment length τ(t-M, t-1)')
+    parser.add_argument('--K', type=int, default=20,
+                        help='Evaluation segment length τ(t, t+K)')
+    parser.add_argument('--task_sampling_freq', type=int, default=1,
+                        help='Collect new trajectories every N iterations (n_S in GrBAL)')
+    parser.add_argument('--max_trajs_per_env', type=int, default=50,
+                        help='Max trajectories to keep per environment in dataset')
+    parser.add_argument('--meta_batch_size', type=int, default=None,
+                        help='Tasks per meta-batch (default: all train envs)')
+
+    # === Phase 3 GrBAL-style Online Evaluation ===
+    parser.add_argument('--eval_every', type=int, default=10,
+                        help='Evaluate on test envs every N iterations during Phase 2 (for sample efficiency)')
+    parser.add_argument('--eval_episodes', type=int, default=10,
+                        help='Episodes per test environment')
+    parser.add_argument('--test_M', type=int, default=None,
+                        help='Adaptation window at test time (default: same as M)')
+    parser.add_argument('--test_adapt_steps', type=int, default=None,
+                        help='Gradient steps at test time (default: same as adapt_steps)')
+    parser.add_argument('--test_inner_lr', type=float, default=None,
+                        help='Inner LR at test time (default: same as training)')
+    parser.add_argument('--no_adapt', action='store_true',
+                        help='Skip online adaptation at test time')
+    parser.add_argument('--deterministic_eval', action='store_true', default=True,
+                        help='Use deterministic (mean) actions for evaluation')
+
+    # === PPO Hyperparameters ===
     parser.add_argument('--gamma', type=float, default=0.99,
                         help='Discount factor')
     parser.add_argument('--clip_eps', type=float, default=0.2,
@@ -94,28 +151,8 @@ def parse_args():
                         help='Minibatch size for PPO')
     parser.add_argument('--max_grad_norm', type=float, default=0.5,
                         help='Gradient clipping norm')
-    parser.add_argument('--entropy_coef', type=float, default=0.0,
+    parser.add_argument('--entropy_coef', type=float, default=0.01,
                         help='Entropy bonus coefficient')
-
-    # === Phase 1 ===
-    parser.add_argument('--phase1_iterations', type=int, default=50,
-                        help='Phase 1 training iterations')
-    parser.add_argument('--phase1_batch_size', type=int, default=5,
-                        help='Trajectories per Phase 1 iteration')
-    parser.add_argument('--lambda_theta', type=float, default=1.0,
-                        help='State prediction loss weight')
-
-    # === Phase 2 ===
-    parser.add_argument('--phase2_iterations', type=int, default=50,
-                        help='Phase 2 training iterations')
-    parser.add_argument('--n_traj_per_env', type=int, default=2,
-                        help='Trajectories per environment in Phase 2')
-
-    # === Phase 3 ===
-    parser.add_argument('--eval_episodes', type=int, default=10,
-                        help='Episodes per test environment')
-    parser.add_argument('--deterministic_eval', action='store_true', default=True,
-                        help='Use deterministic (mean) actions for evaluation')
 
     # === Checkpointing ===
     parser.add_argument('--save_every', type=int, default=50,
@@ -134,14 +171,6 @@ def parse_args():
     # === Device ===
     parser.add_argument('--device', type=str, default='auto',
                         help='Device (auto, cpu, cuda, cuda:0, etc.)')
-
-    # === Parallelism ===
-    parser.add_argument('--vectorized', action='store_true',
-                        help='Use vectorized (batched) rollout for GPU speedup')
-    parser.add_argument('--parallel', action='store_true',
-                        help='Use ParallelEnvExecutor for CPU parallelism (implies --vectorized)')
-    parser.add_argument('--n_parallel', type=int, default=5,
-                        help='Number of parallel CPU workers (only with --parallel)')
 
     return parser.parse_args()
 
@@ -185,12 +214,20 @@ def main():
     os.makedirs(save_dir, exist_ok=True)
     print(f"Saving to: {save_dir}")
 
+    # Convert hidden sizes to tuples
+    policy_hidden_sizes = tuple(args.policy_hidden_sizes)
+    world_model_hidden_sizes = tuple(args.world_model_hidden_sizes)
+
     # Save config
     config = vars(args)
+    config['policy_hidden_sizes'] = policy_hidden_sizes
+    config['world_model_hidden_sizes'] = world_model_hidden_sizes
     with open(os.path.join(save_dir, 'config.json'), 'w') as f:
         json.dump(config, f, indent=2)
+    with open(os.path.join(save_dir, 'params.json'), 'w') as f:
+        json.dump(config, f, indent=2)
 
-    # Get observation and action dimensions from a sample env
+    # Get observation and action dimensions
     sample_env = make_env(args.initial_env, args.task, args.normalize_env)
     obs_dim = sample_env.observation_space.shape[0]
     act_dim = sample_env.action_space.shape[0]
@@ -200,41 +237,51 @@ def main():
     config['obs_dim'] = obs_dim
     config['act_dim'] = act_dim
     config['save_dir'] = save_dir
-    config['batch_size'] = args.phase1_batch_size
+
+    # Set test-time defaults from training values if not specified
+    if config['test_M'] is None:
+        config['test_M'] = config['M']
+    if config['test_adapt_steps'] is None:
+        config['test_adapt_steps'] = config['adapt_steps']
+    if config['test_inner_lr'] is None:
+        config['test_inner_lr'] = config['inner_lr']
 
     # Initialize networks
-    theta = StateProposer(obs_dim, args.hidden_dim)
+    world_model = WorldModel(obs_dim, act_dim, world_model_hidden_sizes)
     phi = ContextEncoder(obs_dim, args.context_dim)
-    psi = Policy(obs_dim, act_dim, args.context_dim, args.hidden_dim)
+    psi = Policy(obs_dim, act_dim, args.context_dim, policy_hidden_sizes)
+
+    # Print parameter counts
+    wm_params = sum(p.numel() for p in world_model.parameters())
+    phi_params = sum(p.numel() for p in phi.parameters())
+    psi_params = sum(p.numel() for p in psi.parameters())
 
     print(f"\nNetwork parameters:")
-    print(f"  theta (StateProposer): {sum(p.numel() for p in theta.parameters()):,}")
-    print(f"  phi (ContextEncoder):  {sum(p.numel() for p in phi.parameters()):,}")
-    print(f"  psi (Policy):          {sum(p.numel() for p in psi.parameters()):,}")
-    print(f"  Total:                 {sum(p.numel() for p in theta.parameters()) + sum(p.numel() for p in phi.parameters()) + sum(p.numel() for p in psi.parameters()):,}")
+    print(f"  WorldModel (p̂):        {wm_params:,}")
+    print(f"  ContextEncoder (φ):    {phi_params:,}")
+    print(f"  Policy (ψ):            {psi_params:,}")
+    print(f"  Total:                 {wm_params + phi_params + psi_params:,}")
 
     # ==================== PHASE 1 ====================
     if not args.skip_phase1:
         print("\n" + "=" * 60)
-        print("PHASE 1: Training on initial environment")
+        print("PHASE 1: Training policy + world model on initial environment")
         print("=" * 60)
         print(f"  Initial env: crippled_leg={args.initial_env}")
+        print(f"  Policy: π_ψ(a|s) - simple, no context")
+        print(f"  World model: p̂(s_{t+1}|s_t, a_t)")
 
         initial_env = make_env(args.initial_env, args.task, args.normalize_env)
 
-        # Create env_fn for vectorized rollout
-        initial_env_fn = lambda: make_env(args.initial_env, args.task, args.normalize_env)
-
         phase1_trainer = Phase1Trainer(
             env=initial_env,
-            theta=theta,
+            world_model=world_model,
             psi=psi,
             config=config,
             device=device,
-            env_fn=initial_env_fn if args.vectorized else None,
         )
 
-        theta, psi = phase1_trainer.train(
+        world_model, psi = phase1_trainer.train(
             n_iterations=args.phase1_iterations,
             save_dir=save_dir,
         )
@@ -242,41 +289,45 @@ def main():
         print("Phase 1 complete!")
 
     elif args.checkpoint:
-        # Load from checkpoint
         print(f"\nLoading Phase 1 from checkpoint: {args.checkpoint}")
-        theta, psi = load_phase1_checkpoint(
+        world_model, psi = load_phase1_checkpoint(
             path=args.checkpoint,
             obs_dim=obs_dim,
             act_dim=act_dim,
-            hidden_dim=args.hidden_dim,
             context_dim=args.context_dim,
+            policy_hidden_sizes=policy_hidden_sizes,
+            world_model_hidden_sizes=world_model_hidden_sizes,
             device=device,
         )
 
     # ==================== PHASE 2 ====================
     if not args.skip_phase2:
         print("\n" + "=" * 60)
-        print("PHASE 2: Meta-training across environments")
+        print("PHASE 2: GrBAL-style MAML meta-training across environments")
         print("=" * 60)
         print(f"  Training envs: crippled_leg={args.train_envs}")
+        print(f"  Test envs (for sample efficiency): crippled_leg={args.test_envs}")
+        print(f"  World model: FROZEN")
+        print(f"  MAML training: φ (context encoder) + ψ (policy)")
+        print(f"  M (adapt segment): {args.M}, K (eval segment): {args.K}")
+        print(f"  Inner LR: {args.inner_lr}, Adapt steps: {args.adapt_steps}")
 
         train_envs = [make_env(leg, args.task, args.normalize_env)
                       for leg in args.train_envs]
 
-        # Create env_fns for vectorized rollout
-        train_env_fns = [
-            (lambda leg=leg: make_env(leg, args.task, args.normalize_env))
-            for leg in args.train_envs
-        ]
+        # Create test envs for periodic evaluation during training (sample efficiency)
+        test_envs_for_eval = [make_env(leg, args.task, args.normalize_env)
+                              for leg in args.test_envs]
 
         phase2_trainer = Phase2Trainer(
             train_envs=train_envs,
-            theta=theta,
+            world_model=world_model,
             phi=phi,
             psi=psi,
             config=config,
             device=device,
-            env_fns=train_env_fns if args.vectorized else None,
+            test_envs=test_envs_for_eval,
+            test_env_ids=args.test_envs,
         )
 
         phi, psi = phase2_trainer.train(
@@ -287,23 +338,30 @@ def main():
         print("Phase 2 complete!")
 
     elif args.checkpoint and args.skip_phase1:
-        # Load Phase 2 checkpoint
         print(f"\nLoading Phase 2 from checkpoint: {args.checkpoint}")
-        theta, phi, psi = load_phase2_checkpoint(
+        world_model, phi, psi = load_phase2_checkpoint(
             path=args.checkpoint,
             obs_dim=obs_dim,
             act_dim=act_dim,
-            hidden_dim=args.hidden_dim,
             context_dim=args.context_dim,
+            policy_hidden_sizes=policy_hidden_sizes,
+            world_model_hidden_sizes=world_model_hidden_sizes,
             device=device,
         )
 
     # ==================== PHASE 3 ====================
     if not args.skip_phase3:
         print("\n" + "=" * 60)
-        print("PHASE 3: Evaluating on test environments")
+        print("PHASE 3: GrBAL-style online evaluation on test environments")
         print("=" * 60)
         print(f"  Test envs: crippled_leg={args.test_envs}")
+        print(f"  Online adaptation: {not args.no_adapt}")
+        if not args.no_adapt:
+            test_M = args.test_M or args.M
+            test_adapt_steps = args.test_adapt_steps or args.adapt_steps
+            print(f"  M (adaptation window): {test_M}")
+            print(f"  Adapt steps: {test_adapt_steps}")
+            print(f"  Inner LR: {args.test_inner_lr or args.inner_lr}")
 
         test_envs = [make_env(leg, args.task, args.normalize_env)
                      for leg in args.test_envs]
@@ -311,7 +369,7 @@ def main():
         evaluator = Phase3Evaluator(
             test_envs=test_envs,
             test_env_ids=args.test_envs,
-            theta=theta,
+            world_model=world_model,
             phi=phi,
             psi=psi,
             config=config,
@@ -321,14 +379,16 @@ def main():
         results = evaluator.evaluate(
             n_episodes=args.eval_episodes,
             save_dir=save_dir,
+            adapt=not args.no_adapt,
         )
 
         print("\nPhase 3 complete!")
         print("\n" + "=" * 60)
         print("FINAL RESULTS")
         print("=" * 60)
-        print(f"  Mean test reward: {results['aggregate']['mean_reward']:.2f}")
-        print(f"  Std test reward:  {results['aggregate']['std_reward']:.2f}")
+        print(f"  Mean test reward (post-adapt): {results['aggregate']['mean_reward']:.2f}")
+        if results['aggregate'].get('pre_adapt_mean_reward'):
+            print(f"  Mean test reward (pre-adapt):  {results['aggregate']['pre_adapt_mean_reward']:.2f}")
 
     print(f"\nExperiment complete! Results saved to: {save_dir}")
 
